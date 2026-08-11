@@ -1,6 +1,7 @@
 import {
 	App,
 	FuzzySuggestModal,
+	Menu,
 	Modal,
 	Notice,
 	Plugin,
@@ -55,6 +56,29 @@ export default class VaultProfilePlugin extends Plugin {
 		await this.loadSettings();
 		this.addSettingTab(new VaultProfileSettingTab(this.app, this));
 
+		this.addRibbonIcon("layers", "Vault Profile Sync", (evt) => {
+			const menu = new Menu();
+			menu.addItem((item) =>
+				item
+					.setTitle("Profil exportieren")
+					.setIcon("upload")
+					.onClick(() => this.promptExport())
+			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Profil importieren")
+					.setIcon("download")
+					.onClick(() => this.promptImportFlow())
+			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Profil löschen")
+					.setIcon("trash")
+					.onClick(() => this.promptDeleteFlow())
+			);
+			menu.showAtMouseEvent(evt);
+		});
+
 		this.addCommand({
 			id: "export-vault-profile",
 			name: "Profil exportieren (Settings + Plugins)",
@@ -64,33 +88,37 @@ export default class VaultProfilePlugin extends Plugin {
 		this.addCommand({
 			id: "import-vault-profile",
 			name: "Profil importieren",
-			callback: () => {
-				const files = this.getProfileFiles();
-				if (files.length === 0) {
-					new Notice(`Keine Profil-Dateien in "${this.settings.profileFolder}" gefunden.`);
-					return;
-				}
-				new ProfilePickerModal(this.app, files, (file) => this.promptImport(file)).open();
-			},
+			callback: () => this.promptImportFlow(),
 		});
 
 		this.addCommand({
 			id: "delete-vault-profile",
 			name: "Profil löschen",
-			callback: () => {
-				const files = this.getProfileFiles();
-				if (files.length === 0) {
-					new Notice(`Keine Profil-Dateien in "${this.settings.profileFolder}" gefunden.`);
-					return;
-				}
-				new ProfilePickerModal(this.app, files, (file) => {
-					new ConfirmModal(this.app, `Profil "${file.basename}" endgültig löschen?`, async () => {
-						await this.app.fileManager.trashFile(file);
-						new Notice(`Profil "${file.basename}" gelöscht.`);
-					}).open();
-				}).open();
-			},
+			callback: () => this.promptDeleteFlow(),
 		});
+	}
+
+	promptImportFlow() {
+		const files = this.getProfileFiles();
+		if (files.length === 0) {
+			new Notice(`Keine Profil-Dateien in "${this.settings.profileFolder}" gefunden.`);
+			return;
+		}
+		new ProfilePickerModal(this.app, files, (file) => this.promptImport(file)).open();
+	}
+
+	promptDeleteFlow() {
+		const files = this.getProfileFiles();
+		if (files.length === 0) {
+			new Notice(`Keine Profil-Dateien in "${this.settings.profileFolder}" gefunden.`);
+			return;
+		}
+		new ProfilePickerModal(this.app, files, (file) => {
+			new ConfirmModal(this.app, `Profil "${file.basename}" endgültig löschen?`, async () => {
+				await this.app.fileManager.trashFile(file);
+				new Notice(`Profil "${file.basename}" gelöscht.`);
+			}).open();
+		}).open();
 	}
 
 	getProfileFiles(): TFile[] {
