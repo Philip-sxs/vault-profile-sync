@@ -66,9 +66,21 @@ export default class VaultProfilePlugin extends Plugin {
 			);
 			menu.addItem((item) =>
 				item
-					.setTitle("Profil importieren")
+					.setTitle("Profil teilen")
+					.setIcon("share-2")
+					.onClick(() => this.promptShareFlow())
+			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Profil importieren (aus Vault)")
 					.setIcon("download")
 					.onClick(() => this.promptImportFlow())
+			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Datei importieren (von Gerät)")
+					.setIcon("file-input")
+					.onClick(() => this.importFromExternalFile())
 			);
 			menu.addItem((item) =>
 				item
@@ -86,9 +98,21 @@ export default class VaultProfilePlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "share-vault-profile",
+			name: "Profil teilen",
+			callback: () => this.promptShareFlow(),
+		});
+
+		this.addCommand({
 			id: "import-vault-profile",
-			name: "Profil importieren",
+			name: "Profil importieren (aus Vault)",
 			callback: () => this.promptImportFlow(),
+		});
+
+		this.addCommand({
+			id: "import-vault-profile-from-device",
+			name: "Datei importieren (von Gerät)",
+			callback: () => this.importFromExternalFile(),
 		});
 
 		this.addCommand({
@@ -96,6 +120,84 @@ export default class VaultProfilePlugin extends Plugin {
 			name: "Profil löschen",
 			callback: () => this.promptDeleteFlow(),
 		});
+	}
+
+	promptShareFlow() {
+		const files = this.getProfileFiles();
+		if (files.length === 0) {
+			new Notice(`Keine Profil-Dateien in "${this.settings.profileFolder}" gefunden.`);
+			return;
+		}
+		new ProfilePickerModal(this.app, files, (file) => this.shareProfileFile(file)).open();
+	}
+
+	async shareProfileFile(file: TFile) {
+		const content = await this.app.vault.read(file);
+		const blob = new Blob([content], { type: "application/json" });
+		const nav = navigator as any;
+
+		if (nav.canShare && nav.share) {
+			const shareFile = new File([blob], file.name, { type: "application/json" });
+			if (nav.canShare({ files: [shareFile] })) {
+				try {
+					await nav.share({ files: [shareFile], title: file.name });
+					return;
+				} catch (e) {
+					if ((e as Error)?.name === "AbortError") return;
+					console.error("Vault Profile Sync: Teilen fehlgeschlagen, falle zurück auf Download", e);
+				}
+			}
+		}
+
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = file.name;
+		document.body.appendChild(a);
+		a.click();
+		a.remove();
+		URL.revokeObjectURL(url);
+	}
+
+	importFromExternalFile() {
+		const input = document.createElement("input");
+		input.type = "file";
+		input.accept = ".json,application/json";
+		input.style.display = "none";
+		input.addEventListener("change", async () => {
+			const picked = input.files?.[0];
+			input.remove();
+			if (!picked) return;
+
+			const text = await picked.text();
+			let bundle: ProfileBundle;
+			try {
+				bundle = JSON.parse(text);
+			} catch (e) {
+				new Notice("Datei konnte nicht gelesen werden (kein gültiges JSON).");
+				return;
+			}
+			if (!bundle.files || bundle.formatVersion !== 1) {
+				new Notice("Unbekanntes Profil-Format.");
+				return;
+			}
+
+			new ConfirmModal(
+				this.app,
+				`Profil "${picked.name}" importieren? Das überschreibt aktuelle Einstellungen, Erscheinungsbild, Hotkeys und Community-Plugins in diesem Vault.`,
+				async () => {
+					await this.applyBundle(bundle);
+
+					const folder = normalizePath(this.settings.profileFolder);
+					await this.ensureFolderRecursive(folder);
+					const baseName = picked.name.replace(/\.json$/i, "");
+					const path = normalizePath(`${folder}/${baseName}.json`);
+					await this.app.vault.adapter.write(path, text);
+				}
+			).open();
+		});
+		document.body.appendChild(input);
+		input.click();
 	}
 
 	promptImportFlow() {
@@ -221,9 +323,6 @@ export default class VaultProfilePlugin extends Plugin {
 	}
 
 	async importProfile(file: TFile) {
-		const adapter = this.app.vault.adapter;
-		const configDir = this.app.vault.configDir;
-
 		let bundle: ProfileBundle;
 		try {
 			const content = await this.app.vault.read(file);
@@ -238,6 +337,13 @@ export default class VaultProfilePlugin extends Plugin {
 			new Notice("Unbekanntes Profil-Format.");
 			return;
 		}
+
+		await this.applyBundle(bundle);
+	}
+
+	async applyBundle(bundle: ProfileBundle) {
+		const adapter = this.app.vault.adapter;
+		const configDir = this.app.vault.configDir;
 
 		let count = 0;
 		for (const [rel, b64] of Object.entries(bundle.files)) {
@@ -376,7 +482,7 @@ class VaultProfileSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Profilordner")
 			.setDesc(
-				"Vault-interner Ordner, in dem Profil-Dateien gespeichert und gesucht werden. Diesen Ordner (bzw. die Profil-Datei darin) manuell über iCloud/Obsidian Sync/AirDrop/Files-App in den Ziel-Vault bringen."
+				"Vault-interner Ordner, in dem Profil-Dateien gespeichert und gesucht werden. Über \"Teilen\" bei einem Profil per AirDrop/Files-App/etc. exportieren, im Ziel-Vault über \"Datei importieren...\" wieder einlesen."
 			)
 			.addText((text) =>
 				text.setValue(this.plugin.settings.profileFolder).onChange(async (value) => {
@@ -402,6 +508,9 @@ class VaultProfileSettingTab extends PluginSettingTab {
 				.setName(file.basename)
 				.setDesc(`Zuletzt geändert: ${date}`)
 				.addButton((btn) =>
+					btn.setButtonText("Teilen").onClick(() => this.plugin.shareProfileFile(file))
+				)
+				.addButton((btn) =>
 					btn.setButtonText("Importieren").onClick(() => this.plugin.promptImport(file))
 				)
 				.addButton((btn) =>
@@ -417,11 +526,15 @@ class VaultProfileSettingTab extends PluginSettingTab {
 				);
 		}
 
-		new Setting(containerEl).addButton((btn) =>
-			btn
-				.setButtonText("Neues Profil exportieren")
-				.setCta()
-				.onClick(() => this.plugin.promptExport(() => this.display()))
-		);
+		new Setting(containerEl)
+			.addButton((btn) =>
+				btn.setButtonText("Datei importieren...").onClick(() => this.plugin.importFromExternalFile())
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Neues Profil exportieren")
+					.setCta()
+					.onClick(() => this.plugin.promptExport(() => this.display()))
+			);
 	}
 }
