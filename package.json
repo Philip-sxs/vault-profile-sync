@@ -1,0 +1,19 @@
+{
+	"name": "vault-profile-sync",
+	"version": "1.0.0",
+	"description": "Export/import full Obsidian vault profiles (settings + plugins) as a single file, desktop and mobile.",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+	},
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"builtin-modules": "^3.3.0",
+		"esbuild": "^0.20.0",
+		"obsidian": "^1.5.7",
+		"tslib": "^2.6.0",
+		"typescript": "^5.4.0"
+	}
+}
