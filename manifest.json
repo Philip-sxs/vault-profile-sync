@@ -1,7 +1,7 @@
 {
 	"id": "vault-profile-sync",
 	"name": "Vault Profile Sync",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"minAppVersion": "1.4.0",
 	"description": "Export all vault settings (appearance, hotkeys, core & community plugins incl. their code and data) into one profile file, and import it into another vault — including on iPad/iPhone.",
 	"author": "philip",

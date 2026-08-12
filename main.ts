@@ -14,11 +14,13 @@ import {
 interface VaultProfileSettings {
 	profileFolder: string;
 	excludedPlugins: string[];
+	autoBackupBeforeImport: boolean;
 }
 
 const DEFAULT_SETTINGS: VaultProfileSettings = {
 	profileFolder: "VaultProfiles",
 	excludedPlugins: [],
+	autoBackupBeforeImport: true,
 };
 
 // Per-device UI state, not part of a portable profile: current pane layout / open tabs.
@@ -30,6 +32,15 @@ interface ProfileBundle {
 	vaultName: string;
 	obsidianConfigDir: string;
 	files: Record<string, string>;
+}
+
+interface EncryptedEnvelope {
+	encrypted: true;
+	kdf: "PBKDF2";
+	iterations: number;
+	salt: string;
+	iv: string;
+	ciphertext: string;
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -49,6 +60,69 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 		bytes[i] = binary.charCodeAt(i);
 	}
 	return bytes.buffer;
+}
+
+function pluginIdsInBundle(bundle: ProfileBundle): string[] {
+	const ids = new Set<string>();
+	for (const rel of Object.keys(bundle.files)) {
+		if (rel.startsWith("plugins/")) {
+			const id = rel.split("/")[1];
+			if (id) ids.add(id);
+		}
+	}
+	return Array.from(ids).sort();
+}
+
+async function encryptBundle(bundle: ProfileBundle, passphrase: string): Promise<EncryptedEnvelope> {
+	const iterations = 200_000;
+	const salt = crypto.getRandomValues(new Uint8Array(16));
+	const iv = crypto.getRandomValues(new Uint8Array(12));
+	const keyMaterial = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(passphrase),
+		"PBKDF2",
+		false,
+		["deriveKey"]
+	);
+	const key = await crypto.subtle.deriveKey(
+		{ name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+		keyMaterial,
+		{ name: "AES-GCM", length: 256 },
+		false,
+		["encrypt"]
+	);
+	const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
+	const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+	return {
+		encrypted: true,
+		kdf: "PBKDF2",
+		iterations,
+		salt: arrayBufferToBase64(salt.buffer),
+		iv: arrayBufferToBase64(iv.buffer),
+		ciphertext: arrayBufferToBase64(ciphertext),
+	};
+}
+
+async function decryptEnvelope(envelope: EncryptedEnvelope, passphrase: string): Promise<ProfileBundle> {
+	const salt = new Uint8Array(base64ToArrayBuffer(envelope.salt));
+	const iv = new Uint8Array(base64ToArrayBuffer(envelope.iv));
+	const keyMaterial = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(passphrase),
+		"PBKDF2",
+		false,
+		["deriveKey"]
+	);
+	const key = await crypto.subtle.deriveKey(
+		{ name: "PBKDF2", salt, iterations: envelope.iterations, hash: "SHA-256" },
+		keyMaterial,
+		{ name: "AES-GCM", length: 256 },
+		false,
+		["decrypt"]
+	);
+	const ciphertext = base64ToArrayBuffer(envelope.ciphertext);
+	const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+	return JSON.parse(new TextDecoder().decode(plainBuf));
 }
 
 export default class VaultProfilePlugin extends Plugin {
@@ -172,31 +246,18 @@ export default class VaultProfilePlugin extends Plugin {
 			if (!picked) return;
 
 			const text = await picked.text();
-			let bundle: ProfileBundle;
-			try {
-				bundle = JSON.parse(text);
-			} catch (e) {
-				new Notice("Datei konnte nicht gelesen werden (kein gültiges JSON).");
-				return;
-			}
-			if (!bundle.files || bundle.formatVersion !== 1) {
-				new Notice("Unbekanntes Profil-Format.");
-				return;
-			}
+			const bundle = await this.resolveBundle(text);
+			if (!bundle) return;
 
-			new ConfirmModal(
-				this.app,
-				`Profil "${picked.name}" importieren? Das überschreibt aktuelle Einstellungen, Erscheinungsbild, Hotkeys und Community-Plugins in diesem Vault.`,
-				async () => {
-					await this.applyBundle(bundle);
+			new ImportPreviewModal(this.app, bundle, async (filtered) => {
+				await this.applyBundle(filtered);
 
-					const folder = normalizePath(this.settings.profileFolder);
-					await this.ensureFolderRecursive(folder);
-					const baseName = picked.name.replace(/\.json$/i, "");
-					const path = normalizePath(`${folder}/${baseName}.json`);
-					await this.app.vault.adapter.write(path, text);
-				}
-			).open();
+				const folder = normalizePath(this.settings.profileFolder);
+				await this.ensureFolderRecursive(folder);
+				const baseName = picked.name.replace(/\.json$/i, "");
+				const path = normalizePath(`${folder}/${baseName}.json`);
+				await this.app.vault.adapter.write(path, text);
+			}).open();
 		});
 		document.body.appendChild(input);
 		input.click();
@@ -209,6 +270,46 @@ export default class VaultProfilePlugin extends Plugin {
 			return;
 		}
 		new ProfilePickerModal(this.app, files, (file) => this.promptImport(file)).open();
+	}
+
+	async promptImport(file: TFile) {
+		const content = await this.app.vault.read(file);
+		const bundle = await this.resolveBundle(content);
+		if (!bundle) return;
+		new ImportPreviewModal(this.app, bundle, (filtered) => this.applyBundle(filtered)).open();
+	}
+
+	/** Parses profile file content into a usable bundle, prompting for a passphrase and decrypting if needed. Shows its own error Notices and returns null on any failure/cancellation. */
+	async resolveBundle(text: string): Promise<ProfileBundle | null> {
+		let parsed: any;
+		try {
+			parsed = JSON.parse(text);
+		} catch (e) {
+			new Notice("Datei konnte nicht gelesen werden (kein gültiges JSON).");
+			return null;
+		}
+
+		if (parsed && parsed.encrypted === true) {
+			const passphrase = await promptPassphrase(this.app);
+			if (passphrase === null) return null;
+			try {
+				const bundle = await decryptEnvelope(parsed as EncryptedEnvelope, passphrase);
+				if (!bundle.files || bundle.formatVersion !== 1) {
+					new Notice("Entschlüsselung ergab ein unbekanntes Profil-Format.");
+					return null;
+				}
+				return bundle;
+			} catch (e) {
+				new Notice("Falsches Passwort oder beschädigte Datei.");
+				return null;
+			}
+		}
+
+		if (!parsed || !parsed.files || parsed.formatVersion !== 1) {
+			new Notice("Unbekanntes Profil-Format.");
+			return null;
+		}
+		return parsed as ProfileBundle;
 	}
 
 	promptDeleteFlow() {
@@ -236,29 +337,19 @@ export default class VaultProfilePlugin extends Plugin {
 	promptExport(onComplete?: () => void) {
 		const today = new Date().toISOString().slice(0, 10);
 		const defaultName = `Profile-${this.app.vault.getName()}-${today}`;
-		new NameInputModal(this.app, defaultName, async (name) => {
+		new ExportModal(this.app, defaultName, async (name, passphrase) => {
+			const doExport = async () => {
+				await this.exportProfile(name, passphrase || undefined);
+				onComplete?.();
+			};
 			const folder = normalizePath(this.settings.profileFolder);
 			const path = normalizePath(`${folder}/${name}.json`);
 			if (await this.app.vault.adapter.exists(path)) {
-				new ConfirmModal(this.app, `Profil "${name}" existiert bereits. Überschreiben?`, async () => {
-					await this.exportProfile(name);
-					onComplete?.();
-				}).open();
+				new ConfirmModal(this.app, `Profil "${name}" existiert bereits. Überschreiben?`, doExport).open();
 			} else {
-				await this.exportProfile(name);
-				onComplete?.();
+				await doExport();
 			}
 		}).open();
-	}
-
-	promptImport(file: TFile) {
-		new ConfirmModal(
-			this.app,
-			`Profil "${file.basename}" importieren? Das überschreibt aktuelle Einstellungen, Erscheinungsbild, Hotkeys und Community-Plugins in diesem Vault.`,
-			async () => {
-				await this.importProfile(file);
-			}
-		).open();
 	}
 
 	async loadSettings() {
@@ -291,7 +382,7 @@ export default class VaultProfilePlugin extends Plugin {
 		}
 	}
 
-	async exportProfile(name: string) {
+	private async buildBundle(): Promise<ProfileBundle> {
 		const adapter = this.app.vault.adapter;
 		const configDir = this.app.vault.configDir;
 		const excluded = new Set(this.settings.excludedPlugins);
@@ -323,41 +414,42 @@ export default class VaultProfilePlugin extends Plugin {
 			}
 		}
 
-		const bundle: ProfileBundle = {
+		return {
 			formatVersion: 1,
 			createdAt: new Date().toISOString(),
 			vaultName: this.app.vault.getName(),
 			obsidianConfigDir: configDir,
 			files,
 		};
+	}
 
+	async exportProfile(name: string, passphrase?: string, opts?: { silent?: boolean }): Promise<string> {
+		const bundle = await this.buildBundle();
 		const folder = normalizePath(this.settings.profileFolder);
 		await this.ensureFolderRecursive(folder);
 		const path = normalizePath(`${folder}/${name}.json`);
-		await adapter.write(path, JSON.stringify(bundle));
-		new Notice(`Profil exportiert: ${path}\n(${Object.keys(files).length} Dateien)`);
-	}
-
-	async importProfile(file: TFile) {
-		let bundle: ProfileBundle;
-		try {
-			const content = await this.app.vault.read(file);
-			bundle = JSON.parse(content);
-		} catch (e) {
-			new Notice("Profil-Datei konnte nicht gelesen/geparst werden.");
-			console.error("Vault Profile Sync: Import fehlgeschlagen", e);
-			return;
+		const content = passphrase ? JSON.stringify(await encryptBundle(bundle, passphrase)) : JSON.stringify(bundle);
+		await this.app.vault.adapter.write(path, content);
+		if (!opts?.silent) {
+			new Notice(
+				`Profil exportiert: ${path}\n(${Object.keys(bundle.files).length} Dateien${
+					passphrase ? ", verschlüsselt" : ""
+				})`
+			);
 		}
-
-		if (!bundle.files || bundle.formatVersion !== 1) {
-			new Notice("Unbekanntes Profil-Format.");
-			return;
-		}
-
-		await this.applyBundle(bundle);
+		return path;
 	}
 
 	async applyBundle(bundle: ProfileBundle) {
+		if (this.settings.autoBackupBeforeImport) {
+			const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+			try {
+				await this.exportProfile(`AutoBackup-vor-Import-${stamp}`, undefined, { silent: true });
+			} catch (e) {
+				console.error("Vault Profile Sync: Auto-Backup vor Import fehlgeschlagen", e);
+			}
+		}
+
 		const adapter = this.app.vault.adapter;
 		const configDir = this.app.vault.configDir;
 
@@ -377,50 +469,208 @@ export default class VaultProfilePlugin extends Plugin {
 		}
 
 		new Notice(
-			`Profil importiert (${count} Dateien). Bitte Obsidian jetzt komplett schließen und neu öffnen, damit alle Änderungen inkl. neuer Plugins wirksam werden.`,
+			`Profil importiert (${count} Dateien).${
+				this.settings.autoBackupBeforeImport ? " Automatisches Backup des vorherigen Zustands wurde angelegt." : ""
+			} Bitte Obsidian jetzt komplett schließen und neu öffnen, damit alle Änderungen inkl. neuer Plugins wirksam werden.`,
 			10000
 		);
 	}
 }
 
-class NameInputModal extends Modal {
-	private result: string;
-	private onSubmit: (result: string) => void;
+function promptPassphrase(app: App): Promise<string | null> {
+	return new Promise((resolve) => {
+		new PassphraseModal(
+			app,
+			(pass) => resolve(pass),
+			() => resolve(null)
+		).open();
+	});
+}
 
-	constructor(app: App, defaultName: string, onSubmit: (result: string) => void) {
+class PassphraseModal extends Modal {
+	private value = "";
+	private onSubmit: (passphrase: string) => void;
+	private onCancel: () => void;
+
+	constructor(app: App, onSubmit: (passphrase: string) => void, onCancel: () => void) {
 		super(app);
-		this.result = defaultName;
+		this.onSubmit = onSubmit;
+		this.onCancel = onCancel;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: "Profil ist verschlüsselt" });
+		contentEl.createEl("p", { text: "Passwort eingeben, um es zu entschlüsseln." });
+
+		const input = contentEl.createEl("input", { type: "password" });
+		input.style.width = "100%";
+		input.addEventListener("input", (e) => {
+			this.value = (e.target as HTMLInputElement).value;
+		});
+		input.focus();
+
+		const submit = () => {
+			this.close();
+			this.onSubmit(this.value);
+		};
+
+		input.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") submit();
+		});
+
+		new Setting(contentEl)
+			.addButton((btn) => btn.setButtonText("Abbrechen").onClick(() => this.close()))
+			.addButton((btn) => btn.setButtonText("Entschlüsseln").setCta().onClick(submit));
+	}
+
+	onClose() {
+		this.contentEl.empty();
+		this.onCancel();
+	}
+}
+
+class ExportModal extends Modal {
+	private name: string;
+	private passphrase = "";
+	private submitted = false;
+	private onSubmit: (name: string, passphrase: string) => void;
+
+	constructor(app: App, defaultName: string, onSubmit: (name: string, passphrase: string) => void) {
+		super(app);
+		this.name = defaultName;
 		this.onSubmit = onSubmit;
 	}
 
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.createEl("h3", { text: "Profil exportieren" });
-		const input = contentEl.createEl("input", { type: "text", value: this.result });
-		input.style.width = "100%";
-		input.addEventListener("input", (e) => {
-			this.result = (e.target as HTMLInputElement).value;
-		});
-		input.focus();
-		input.select();
 
-		new Setting(contentEl).addButton((btn) =>
-			btn
-				.setButtonText("Exportieren")
-				.setCta()
-				.onClick(() => {
-					if (!this.result.trim()) return;
-					this.close();
-					this.onSubmit(this.result.trim());
-				})
+		let nameInputEl: HTMLInputElement;
+		new Setting(contentEl).setName("Name").addText((text) => {
+			nameInputEl = text.inputEl;
+			text.setValue(this.name).onChange((v) => (this.name = v));
+			text.inputEl.style.width = "100%";
+		});
+
+		new Setting(contentEl)
+			.setName("Passwort (optional)")
+			.setDesc("Verschlüsselt die Profil-Datei (AES-256-GCM). Leer lassen für unverschlüsselt.")
+			.addText((text) => {
+				text.inputEl.type = "password";
+				text.onChange((v) => (this.passphrase = v));
+			});
+
+		const submit = () => {
+			if (this.submitted || !this.name.trim()) return;
+			this.submitted = true;
+			this.close();
+			this.onSubmit(this.name.trim(), this.passphrase);
+		};
+
+		new Setting(contentEl).addButton((btn) => btn.setButtonText("Exportieren").setCta().onClick(submit));
+
+		contentEl.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") submit();
+		});
+
+		window.setTimeout(() => {
+			nameInputEl.focus();
+			nameInputEl.select();
+		});
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+class ImportPreviewModal extends Modal {
+	private bundle: ProfileBundle;
+	private onConfirm: (filteredBundle: ProfileBundle) => void;
+	private includeAppSettings = true;
+	private includedPlugins: Set<string>;
+
+	constructor(app: App, bundle: ProfileBundle, onConfirm: (filteredBundle: ProfileBundle) => void) {
+		super(app);
+		this.bundle = bundle;
+		this.onConfirm = onConfirm;
+		this.includedPlugins = new Set(pluginIdsInBundle(bundle));
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: "Profil importieren" });
+
+		const info = contentEl.createEl("p");
+		info.style.whiteSpace = "pre-wrap";
+		info.setText(
+			`Vault: ${this.bundle.vaultName}\n` +
+				`Erstellt: ${new Date(this.bundle.createdAt).toLocaleString()}\n` +
+				`Dateien insgesamt: ${Object.keys(this.bundle.files).length}`
 		);
 
-		input.addEventListener("keydown", (e) => {
-			if (e.key === "Enter" && this.result.trim()) {
-				this.close();
-				this.onSubmit(this.result.trim());
-			}
+		contentEl.createEl("p", {
+			text: "Überschreibt die unten ausgewählten Bereiche in diesem Vault. Ein automatisches Backup des aktuellen Zustands wird vorher angelegt (falls in den Einstellungen aktiviert).",
+			cls: "setting-item-description",
 		});
+
+		new Setting(contentEl)
+			.setName("App-Einstellungen")
+			.setDesc("Appearance, Hotkeys, Core-Plugins, Snippets, Themes, Icons, ...")
+			.addToggle((toggle) =>
+				toggle.setValue(this.includeAppSettings).onChange((v) => (this.includeAppSettings = v))
+			);
+
+		const pluginIds = pluginIdsInBundle(this.bundle);
+		if (pluginIds.length > 0) {
+			new Setting(contentEl).setName("Plugins").setHeading();
+			for (const id of pluginIds) {
+				new Setting(contentEl).setName(id).addToggle((toggle) =>
+					toggle.setValue(true).onChange((v) => {
+						if (v) this.includedPlugins.add(id);
+						else this.includedPlugins.delete(id);
+					})
+				);
+			}
+		}
+
+		new Setting(contentEl)
+			.addButton((btn) => btn.setButtonText("Abbrechen").onClick(() => this.close()))
+			.addButton((btn) =>
+				btn
+					.setButtonText("Importieren")
+					.setWarning()
+					.onClick(() => {
+						this.close();
+						this.onConfirm(this.buildFilteredBundle());
+					})
+			);
+	}
+
+	private buildFilteredBundle(): ProfileBundle {
+		const filteredFiles: Record<string, string> = {};
+		for (const [rel, data] of Object.entries(this.bundle.files)) {
+			if (rel.startsWith("plugins/")) {
+				const id = rel.split("/")[1];
+				if (id && this.includedPlugins.has(id)) filteredFiles[rel] = data;
+				continue;
+			}
+			if (!this.includeAppSettings) continue;
+			if (rel === "community-plugins.json") {
+				try {
+					const text = new TextDecoder().decode(base64ToArrayBuffer(data));
+					const enabled: string[] = JSON.parse(text);
+					const cleaned = enabled.filter((id) => this.includedPlugins.has(id));
+					filteredFiles[rel] = arrayBufferToBase64(new TextEncoder().encode(JSON.stringify(cleaned)).buffer);
+				} catch (e) {
+					filteredFiles[rel] = data;
+				}
+				continue;
+			}
+			filteredFiles[rel] = data;
+		}
+		return { ...this.bundle, files: filteredFiles };
 	}
 
 	onClose() {
@@ -464,12 +714,13 @@ class ConfirmModal extends Modal {
 
 	onOpen() {
 		const { contentEl } = this;
-		contentEl.createEl("p", { text: this.message });
+		const p = contentEl.createEl("p", { text: this.message });
+		p.style.whiteSpace = "pre-wrap";
 		new Setting(contentEl)
 			.addButton((btn) => btn.setButtonText("Abbrechen").onClick(() => this.close()))
 			.addButton((btn) =>
 				btn
-					.setButtonText("Importieren")
+					.setButtonText("Bestätigen")
 					.setWarning()
 					.onClick(() => {
 						this.close();
@@ -498,7 +749,7 @@ class VaultProfileSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Profilordner")
 			.setDesc(
-				"Vault-interner Ordner, in dem Profil-Dateien gespeichert und gesucht werden. Über \"Teilen\" bei einem Profil per AirDrop/Files-App/etc. exportieren, im Ziel-Vault über \"Datei importieren...\" wieder einlesen."
+				'Vault-interner Ordner, in dem Profil-Dateien gespeichert und gesucht werden. Über "Teilen" bei einem Profil per AirDrop/Files-App/etc. exportieren, im Ziel-Vault über "Datei importieren..." wieder einlesen.'
 			)
 			.addText((text) =>
 				text.setValue(this.plugin.settings.profileFolder).onChange(async (value) => {
@@ -508,14 +759,25 @@ class VaultProfileSettingTab extends PluginSettingTab {
 				})
 			);
 
+		new Setting(containerEl)
+			.setName("Automatisches Backup vor Import")
+			.setDesc(
+				'Legt vor jedem Import automatisch ein Profil des aktuellen Zustands an (erscheint als "AutoBackup-vor-Import-..." in der Liste unten).'
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.autoBackupBeforeImport).onChange(async (value) => {
+					this.plugin.settings.autoBackupBeforeImport = value;
+					await this.plugin.saveSettings();
+				})
+			);
+
 		new Setting(containerEl).setName("Plugins vom Export ausschließen").setHeading();
 		containerEl.createEl("p", {
 			text: "Ausgeschlossene Plugins landen nicht in neuen Profil-Exporten (Code + Einstellungen), und werden auch aus der Liste der zu aktivierenden Plugins entfernt. Sinnvoll z.B. für Sync-Plugins mit vault-spezifischen Zugangsdaten.",
 			cls: "setting-item-description",
 		});
 
-		const manifests: Record<string, { id: string; name: string }> =
-			(this.app as any).plugins?.manifests ?? {};
+		const manifests: Record<string, { id: string; name: string }> = (this.app as any).plugins?.manifests ?? {};
 		const pluginList = Object.values(manifests).sort((a, b) => a.name.localeCompare(b.name));
 
 		if (pluginList.length === 0) {
@@ -547,22 +809,45 @@ class VaultProfileSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl).setName("Profile").setHeading();
 
+		const listContainer = containerEl.createDiv();
+		this.renderProfileList(listContainer);
+
+		new Setting(containerEl)
+			.addButton((btn) =>
+				btn.setButtonText("Datei importieren...").onClick(() => this.plugin.importFromExternalFile())
+			)
+			.addButton((btn) =>
+				btn
+					.setButtonText("Neues Profil exportieren")
+					.setCta()
+					.onClick(() => this.plugin.promptExport(() => this.display()))
+			);
+	}
+
+	private async renderProfileList(listContainer: HTMLElement) {
 		const files = this.plugin.getProfileFiles();
 		if (files.length === 0) {
-			containerEl.createEl("p", {
+			listContainer.createEl("p", {
 				text: `Noch keine Profile in "${this.plugin.settings.profileFolder}".`,
 				cls: "setting-item-description",
 			});
+			return;
 		}
 
 		for (const file of files) {
 			const date = new Date(file.stat.mtime).toLocaleString();
-			new Setting(containerEl)
-				.setName(file.basename)
+			let locked = false;
+			try {
+				const text = await this.app.vault.cachedRead(file);
+				locked = JSON.parse(text)?.encrypted === true;
+			} catch (e) {
+				// unreadable/non-JSON file in the profile folder, ignore
+			}
+
+			new Setting(listContainer)
+				.setName(locked ? `🔒 ${file.basename}` : file.basename)
 				.setDesc(`Zuletzt geändert: ${date}`)
-				.addButton((btn) =>
-					btn.setButtonText("Teilen").onClick(() => this.plugin.shareProfileFile(file))
-				)
+				.addButton((btn) => btn.setButtonText("Teilen").onClick(() => this.plugin.shareProfileFile(file)))
 				.addButton((btn) =>
 					btn.setButtonText("Importieren").onClick(() => this.plugin.promptImport(file))
 				)
@@ -578,16 +863,5 @@ class VaultProfileSettingTab extends PluginSettingTab {
 						})
 				);
 		}
-
-		new Setting(containerEl)
-			.addButton((btn) =>
-				btn.setButtonText("Datei importieren...").onClick(() => this.plugin.importFromExternalFile())
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText("Neues Profil exportieren")
-					.setCta()
-					.onClick(() => this.plugin.promptExport(() => this.display()))
-			);
 	}
 }
