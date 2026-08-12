@@ -13,10 +13,12 @@ import {
 
 interface VaultProfileSettings {
 	profileFolder: string;
+	excludedPlugins: string[];
 }
 
 const DEFAULT_SETTINGS: VaultProfileSettings = {
 	profileFolder: "VaultProfiles",
+	excludedPlugins: [],
 };
 
 // Per-device UI state, not part of a portable profile: current pane layout / open tabs.
@@ -292,16 +294,30 @@ export default class VaultProfilePlugin extends Plugin {
 	async exportProfile(name: string) {
 		const adapter = this.app.vault.adapter;
 		const configDir = this.app.vault.configDir;
+		const excluded = new Set(this.settings.excludedPlugins);
 
 		const allPaths = await this.listAllFiles(configDir);
-		const filtered = allPaths.filter((p) => !EXCLUDED_BASENAMES.has(p.split("/").pop() ?? ""));
+		const filtered = allPaths.filter((p) => {
+			if (EXCLUDED_BASENAMES.has(p.split("/").pop() ?? "")) return false;
+			const rel = p.substring(configDir.length + 1);
+			const [first, second] = rel.split("/");
+			return !(first === "plugins" && excluded.has(second));
+		});
 
 		const files: Record<string, string> = {};
 		for (const path of filtered) {
 			const rel = path.substring(configDir.length + 1);
 			try {
-				const buf = await adapter.readBinary(path);
-				files[rel] = arrayBufferToBase64(buf);
+				if (rel === "community-plugins.json" && excluded.size > 0) {
+					// Strip excluded plugin ids so the target vault isn't told to enable a plugin whose files we didn't include.
+					const raw = await adapter.read(path);
+					const enabled: string[] = JSON.parse(raw);
+					const cleaned = enabled.filter((id) => !excluded.has(id));
+					files[rel] = arrayBufferToBase64(new TextEncoder().encode(JSON.stringify(cleaned)).buffer);
+				} else {
+					const buf = await adapter.readBinary(path);
+					files[rel] = arrayBufferToBase64(buf);
+				}
 			} catch (e) {
 				console.error(`Vault Profile Sync: konnte ${path} nicht lesen`, e);
 			}
@@ -491,6 +507,43 @@ class VaultProfileSettingTab extends PluginSettingTab {
 					this.display();
 				})
 			);
+
+		new Setting(containerEl).setName("Plugins vom Export ausschließen").setHeading();
+		containerEl.createEl("p", {
+			text: "Ausgeschlossene Plugins landen nicht in neuen Profil-Exporten (Code + Einstellungen), und werden auch aus der Liste der zu aktivierenden Plugins entfernt. Sinnvoll z.B. für Sync-Plugins mit vault-spezifischen Zugangsdaten.",
+			cls: "setting-item-description",
+		});
+
+		const manifests: Record<string, { id: string; name: string }> =
+			(this.app as any).plugins?.manifests ?? {};
+		const pluginList = Object.values(manifests).sort((a, b) => a.name.localeCompare(b.name));
+
+		if (pluginList.length === 0) {
+			containerEl.createEl("p", {
+				text: "Keine Community-Plugins installiert.",
+				cls: "setting-item-description",
+			});
+		}
+
+		for (const manifest of pluginList) {
+			new Setting(containerEl)
+				.setName(manifest.name)
+				.setDesc(manifest.id)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(this.plugin.settings.excludedPlugins.includes(manifest.id))
+						.onChange(async (value) => {
+							const set = new Set(this.plugin.settings.excludedPlugins);
+							if (value) {
+								set.add(manifest.id);
+							} else {
+								set.delete(manifest.id);
+							}
+							this.plugin.settings.excludedPlugins = Array.from(set);
+							await this.plugin.saveSettings();
+						})
+				);
+		}
 
 		new Setting(containerEl).setName("Profile").setHeading();
 
